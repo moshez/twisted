@@ -21,7 +21,10 @@ from threading import local, Lock
 from zope.interface import implementer
 from zope.interface.verify import verifyObject
 
-from twisted.internet.interfaces import IResolutionReceiver, IResolverSimple
+from twisted.internet.interfaces import (
+    IResolutionReceiver, IResolverSimple, IReactorPluggableNameResolver,
+    IHostnameResolver,
+)
 
 from twisted.trial.unittest import (
     SynchronousTestCase as UnitTest
@@ -517,6 +520,23 @@ class LegacyCompatibilityTests(UnitTest, object):
         self.assertEqual(self.successResultOf(success), '192.168.3.4')
 
 
+    def test_portNumber(self):
+        """
+        L{SimpleResolverComplexifier} preserves the C{port} argument passed to
+        C{resolveHostName} in its returned addresses.
+        """
+        simple = SillyResolverSimple()
+        complex = SimpleResolverComplexifier(simple)
+        receiver = ResultHolder(self)
+        complex.resolveHostName(receiver, u"example.com", 4321)
+        self.assertEqual(receiver._started, True)
+        self.assertEqual(receiver._ended, False)
+        self.assertEqual(receiver._addresses, [])
+        simple._requests[0].callback("192.168.1.1")
+        self.assertEqual(receiver._addresses,
+                         [IPv4Address('TCP', '192.168.1.1', 4321)])
+        self.assertEqual(receiver._ended, True)
+
 
 class JustEnoughReactor(ReactorBase, object):
     """
@@ -534,6 +554,17 @@ class ReactorInstallationTests(UnitTest, object):
     Tests for installing old and new resolvers onto a L{ReactorBase} (from
     which all of Twisted's reactor implementations derive).
     """
+
+    def test_interfaceCompliance(self):
+        """
+        L{ReactorBase} (and its subclasses) provide both
+        L{IReactorPluggableNameResolver} and L{IReactorPluggableResolver}.
+        """
+        reactor = JustEnoughReactor()
+        verifyObject(IReactorPluggableNameResolver, reactor)
+        verifyObject(IResolverSimple, reactor.resolver)
+        verifyObject(IHostnameResolver, reactor.nameResolver)
+
 
     def test_defaultToGAIResolver(self):
         """

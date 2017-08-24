@@ -10,20 +10,13 @@ from __future__ import absolute_import, division
 
 import os
 
-from twisted.web import server, static, script, demo, wsgi
+from twisted.application import service, strports
 from twisted.internet import interfaces, reactor
 from twisted.python import usage, reflect, threadpool
-from twisted.python.compat import _PY3
-from twisted.application import internet, service, strports
-
-if not _PY3:
-    # FIXME: https://twistedmatrix.com/trac/ticket/8009
-    from twisted.web import twcgi
-
-    # FIXME: https://twistedmatrix.com/trac/ticket/8010
-    # FIXME: https://twistedmatrix.com/trac/ticket/7598
-    from twisted.web import distrib
-    from twisted.spread import pb
+from twisted.spread import pb
+from twisted.web import distrib
+from twisted.web import resource, server, static, script, demo, wsgi
+from twisted.web import twcgi
 
 
 
@@ -33,9 +26,7 @@ class Options(usage.Options):
     """
     synopsis = "[web options]"
 
-    optParameters = [["port", "p", None, "strports description of the port to "
-                      "start the server on."],
-                     ["logfile", "l", None,
+    optParameters = [["logfile", "l", None,
                       "Path to web CLF (Combined Log Format) log file."],
                      ["https", None, None,
                       "Port to listen on for Secure HTTP."],
@@ -51,13 +42,12 @@ class Options(usage.Options):
             "tracebacks to users may be security risk!")],
     ]
 
-    if not _PY3:
-        optFlags.append([
-            "personal", "",
-            "Instead of generating a webserver, generate a "
-            "ResourcePublisher which listens on  the port given by "
-            "--port, or ~/%s " % (distrib.UserDirectory.userSocketName,) +
-            "if --port is not specified."])
+    optFlags.append([
+        "personal", "",
+        "Instead of generating a webserver, generate a "
+        "ResourcePublisher which listens on  the port given by "
+        "--port, or ~/%s " % (distrib.UserDirectory.userSocketName,) +
+        "if --port is not specified."])
 
     compData = usage.Completions(
                    optActions={"logfile" : usage.CompleteFiles("*.log"),
@@ -73,6 +63,18 @@ demo webserver that has the Test class from twisted.web.demo in it."""
         usage.Options.__init__(self)
         self['indexes'] = []
         self['root'] = None
+        self['extraHeaders'] = []
+        self['ports'] = []
+
+
+    def opt_port(self, port):
+        """
+        Strports description of port to start the server on.
+        [default: tcp:8080]
+        """
+        self['ports'].append(port)
+
+    opt_p = opt_port
 
 
     def opt_index(self, indexName):
@@ -106,8 +108,7 @@ demo webserver that has the Test class from twisted.web.demo in it."""
             '.epy': script.PythonScript,
             '.rpy': script.ResourceScript,
         }
-        if not _PY3:
-            self['root'].processors['.cgi'] = twcgi.CGIScript
+        self['root'].processors['.cgi'] = twcgi.CGIScript
 
 
     def opt_processor(self, proc):
@@ -183,6 +184,15 @@ demo webserver that has the Test class from twisted.web.demo in it."""
         self['root'].ignoreExt(ext)
 
 
+    def opt_add_header(self, header):
+        """
+        Specify an additional header to be included in all responses. Specified
+        as "HeaderName: HeaderValue".
+        """
+        name, value = header.split(':', 1)
+        self['extraHeaders'].append((name.strip(), value.strip()))
+
+
     def postOptions(self):
         """
         Set up conditional defaults and check for dependencies.
@@ -193,18 +203,21 @@ demo webserver that has the Test class from twisted.web.demo in it."""
         If no server port was supplied, select a default appropriate for the
         other options supplied.
         """
-        if self['https']:
-            try:
-                reflect.namedModule('OpenSSL.SSL')
-            except ImportError:
-                raise usage.UsageError("SSL support not installed")
-        if self['port'] is None:
-            if not _PY3 and self['personal']:
+        if len(self['ports']) == 0:
+            if self['personal']:
                 path = os.path.expanduser(
                     os.path.join('~', distrib.UserDirectory.userSocketName))
-                self['port'] = 'unix:' + path
+                self['ports'].append('unix:' + path)
             else:
-                self['port'] = 'tcp:8080'
+                self['ports'].append('tcp:8080')
+        if self['https']:
+            # TODO: Deprecate it?
+            sslStrport = 'ssl:port={}:privateKey={}:certKey={}'.format(
+                             self['https'],
+                             self['privkey'],
+                             self['certificate'],
+                         )
+            self['ports'].append(sslStrport)
 
 
 
@@ -217,6 +230,19 @@ def makePersonalServerFactory(site):
     @rtype: L{twisted.internet.protocol.Factory}
     """
     return pb.PBServerFactory(distrib.ResourcePublisher(site))
+
+
+
+class _AddHeadersResource(resource.Resource):
+    def __init__(self, originalResource, headers):
+        self._originalResource = originalResource
+        self._headers = headers
+
+
+    def getChildWithDefault(self, name, request):
+        for k, v in self._headers:
+            request.responseHeaders.addRawHeader(k, v)
+        return self._originalResource.getChildWithDefault(name, request)
 
 
 
@@ -233,6 +259,9 @@ def makeService(config):
     if isinstance(root, static.File):
         root.registry.setComponent(interfaces.IServiceCollection, s)
 
+    if config['extraHeaders']:
+        root = _AddHeadersResource(root, config['extraHeaders'])
+
     if config['logfile']:
         site = server.Site(root, logPath=config['logfile'])
     else:
@@ -240,21 +269,9 @@ def makeService(config):
 
     site.displayTracebacks = not config["notracebacks"]
 
-    if not _PY3 and config['personal']:
-        personal = strports.service(
-            config['port'], makePersonalServerFactory(site))
-        personal.setServiceParent(s)
-    else:
-        if config['https']:
-            from twisted.internet.ssl import DefaultOpenSSLContextFactory
-            i = internet.SSLServer(int(config['https']), site,
-                          DefaultOpenSSLContextFactory(config['privkey'],
-                                                       config['certificate']))
-            i.setServiceParent(s)
-        strports.service(config['port'], site).setServiceParent(s)
-
+    if config['personal']:
+        site = makePersonalServerFactory(site)
+    for port in config['ports']:
+        svc = strports.service(port, site)
+        svc.setServiceParent(s)
     return s
-
-
-if _PY3:
-    del makePersonalServerFactory
